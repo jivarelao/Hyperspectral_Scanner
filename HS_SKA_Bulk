@@ -1,0 +1,240 @@
+function [centroid_abs, kernel_abs] = HS_SKA_Bulk(filename,ref_table,ref_Path,image_counter,res_Path,display)
+
+%{
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+About:
+HS_SKA_Bulk : HyperSpectral Single Kernel Analizer is the main function to handle
+hyperspectral images from the Macrophor HS using the Specim FX 17 Camera.
+
+1)filename: image name
+2)ref_table: csv file with full path of a table that links each image name to
+each white and dark reference. The table should have at least 3 columns with 
+the following exact column names:raw_name: Image to analize name (without extension)
+ref_white_name: White reference name (without extension)
+ref_dark_name: Dark reference name (without extension)
+3)ref_Path:Path were reference images are stored
+4)image_counter: iterator to 
+
+rPath: reference path.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Dependency:
+parseHdrInfo.m
+readPart.mimage_counter=j;
+    filename=strcat(file_path, f(j).name);  
+NIR_absorbance.m
+kernel_absorbance.m
+
+
+%}
+%%
+fprintf(['***********************************************************\n']);
+    versionString = 'Publication Version XX - Monday, Decembet 27, 2020. \n';
+    startString = 'Starting kernel analysis algorithm. \n';
+    fprintf([startString,versionString]);
+    fprintf(['*******************************************************\n']);
+    totalTimeInit = clock;
+    clear versionString  startString
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+if ~exist('display','var')
+    display=1;
+end
+if ~exist('save_binary','var')
+    save_binary=1;
+end
+if ~exist('save_kernel_image','var')
+    save_kernel_image=1;
+end
+
+
+
+% Get file parts
+[path name extension] = fileparts(filename);
+
+% Get metadata from header file (hdr)
+img_hdr=strcat(name,'.hdr');
+[wavelengths, spatial,frames,spectral,tint,settings]= parseHdrInfo(path,img_hdr);
+
+%Read Image
+fid = fopen(filename);
+raw = readPart(fid,spatial,spectral,frames,12);
+clear fid spatial spectral frames tint settings
+
+% Import reference table guide
+ref_linker_table = readtable(ref_table,'Delimiter','comma');
+
+%Get reference
+iRow = find(strcmp(ref_linker_table{:,1},name)==1);
+
+    % Convert Table  to cell, easier to index
+C=table2cell(ref_linker_table);
+Wref=C{iRow,2};
+Dref=C{iRow,3};
+
+    % Import references metadata
+        %White Reference
+Wref_hdr=strcat(Wref,'.hdr');
+[wavelengths_Wref,spatial_Wref,frames_Wref,spectral_Wref,tint_Wref,settings_Wref]...
+    = parseHdrInfo(ref_Path,Wref_hdr);
+        %Dark Reference
+Dref_hdr=strcat(Dref,'.hdr');
+[wavelengths_Dref,spatial_Dref,frames_Dref,spectral_Dref,tint_Wref,settings_Wref]...
+    = parseHdrInfo(ref_Path,Dref_hdr); 
+    % Import reference images
+    
+fid_Wref = fopen(strcat(ref_Path,'/',Wref,'.raw'));
+Wref_raw = readPart(fid_Wref,spatial_Wref,spectral_Wref,frames_Wref,12);
+
+fid_Dref = fopen(strcat(ref_Path,'/',Dref,'.raw'));
+Dref_raw = readPart(fid_Dref,spatial_Dref,spectral_Dref,frames_Dref,12);
+
+clear ref_linker_table C Wref Dref iRow fid_Dref fid_Wref settings_Dref...
+    settings_Wref spectral_Dref spectral_Wref wavelengths_Dref ...
+    wavelengths_Wref tint_Dref tint_Wref Dref_hdr Wref_hdr frames_Dref...
+    frames_Wref spatial_Dref spatial_Wref
+
+% Make absorbance array
+absorbance_array=NIR_absorbance(Wref_raw,Dref_raw,raw);
+clear Wref_hdr Wref_raw Dref_raw Dref_hdr
+
+
+% Cut the image to the usefull area (get rid of frames)
+absorbance_array_cut=absorbance_array(76:3055,93:600,:);
+
+%Make binary mask
+% Use a hard treshold in 45 wv
+B_MASK= absorbance_array_cut(:,:,45) > 1.4*graythresh(absorbance_array_cut(:,:,45));
+% Remove debries of less than 300 pixels
+
+% fill holes
+
+% remove objects connected to the kernel and are thin
+
+%
+se=strel('disk',1);
+B_MASK= imerode(B_MASK,se);
+B_MASK=imcomplement(B_MASK);
+% remove objects connected to the kernel and are thin
+B_MASK = imfill(B_MASK,8,'holes');
+%
+B_MASK = bwareaopen(B_MASK,700);  
+%B_MASK=imcomplement(B_MASK);
+
+B=bwboundaries(B_MASK);
+
+
+%Clear seed touching border
+B_MASK_CB = imclearborder(B_MASK); %Added 3_11_22
+
+
+R = regionprops(B_MASK_CB,'Area','MajorAxis','MinorAxis','Image','Centroid','Orientation',...
+    'Eccentricity','BoundingBox','Perimeter','Circularity');
+%
+centroids=cat(1,R.Centroid);
+
+%Make a binary with BB over non-bordered kernels
+Boxes=cat(1,R.BoundingBox);
+
+maskm = false(size(B_MASK,1),size(B_MASK,2));
+for k1 = 1:size(Boxes,1);
+    %%// Initialize a mask representing each bounding box
+    mask1 = false(size(B_MASK,1),size(B_MASK,2));
+    %%// Get coordinate of the boxes
+    starty = round(Boxes(k1,1));
+    stopy = starty+round(Boxes(k1,3))-1;
+    startx = round(Boxes(k1,2));
+    stopx = startx+round(Boxes(k1,4))-1;
+    
+    %// Create the mask
+    mask1(startx:stopx,starty:stopy)=true;
+    maskm = maskm + imdilate(edge(mask1,'sobel'),strel('disk',2));
+end
+    
+maskm = maskm+B_MASK;
+
+% Export binary
+if save_binary == 1
+   save(strcat(res_Path,name,'.mat'),'maskm') % SAve binary as .mat
+   imwrite(maskm,strcat(res_Path,name,'.tif')) %export imary as tif with BB
+else
+end
+
+
+%get avg absorbance per kernel in centroid
+fprintf(['Computing average absorbance per kernel in centroid\n']);
+
+image_number=image_counter;
+centroid_abs=[];
+
+for j=1:size(centroids,1)
+    centroid_abs(j,1)=image_number; % Image number of the batch
+    centroid_abs(j,2)=j; % Kernel number of the image
+    centroid_abs(j,3)=R(j).Centroid(1); % X coord of centroid. 
+    centroid_abs(j,4)=R(j).Centroid(2); % Y coord of centroid
+    centroid_abs(j,5)=R(j).Perimeter; %  Perimeter  
+    centroid_abs(j,6)=R(j).Circularity; % Circularity
+    centroid_abs(j,7)=R(j).Area; % Area
+    
+    for i=1:size(absorbance_array,3);
+         temp_channel=absorbance_array_cut(:,:,i);
+         centroid_abs(j,i+7)=nanmean(temp_channel(round(centroids(j,2))-1:round(centroids(j,2))+1,...
+         round(centroids(j,1))-1:round(centroids(j,1))+1),'all');
+     %Maybe reeplace centroids(j,s) by directly calling R 
+    end   
+end
+%
+
+%%
+fprintf(['Computing average absorbance per kernel\n']);
+kernel_abs=[];
+ for j =1:size(R,1);
+     temp=(imcrop(absorbance_array_cut(:,:,45),R(j).BoundingBox));
+     %seems like wavelenght in row 45 its a good one to compute graythresh
+     temp_MASK= temp > 1.4*graythresh(temp);
+     temp_MASK=imcomplement(temp_MASK);
+     se = strel('disk',1);
+     temp_MASK_adj=imerode(temp_MASK,se);
+     temp_MASK_adj=bwareaopen(temp_MASK_adj,700);
+     CC=bwconncomp(temp_MASK_adj);
+     
+     if CC.NumObjects > 1
+            S = regionprops(CC, 'Area');
+            L = labelmatrix(CC);
+            temp_MASK_adj=ismember(L,find([S.Area]>min(str2mat(S.Area))));
+     else
+     end
+     if display ~=0
+        figure;
+        imshow(temp,'InitialMagnification',400);
+        hold on;
+        figure;
+        imshow(temp_MASK_adj,'InitialMagnification',400);
+        pause(1);
+        close all;
+        fprintf('iter %d',j);%%%%% added 1/29 QC
+        fprintf('\n',j);%%%%% added 1/29 QC
+     else
+     end
+     kernel_abs(j,1)=image_counter;
+     kernel_abs(j,2)=j;
+     avg_wv=[];
+     if CC.NumObjects == 0
+     
+     else
+         for i=1:size(absorbance_array_cut,3)
+             temp2=(imcrop(absorbance_array_cut(:,:,i),R(j).BoundingBox));   
+             avg_wv(i)=mean2(temp2(logical(temp_MASK_adj)));% Updated 3_11
+             kernel_abs(j,i+2)=nanmean(temp2(logical(temp_MASK_adj)),'all'); %Updated 3_11 
+         end
+     end
+     
+     kernel_data=kernel_abs;
+               
+ end
+ fprintf(['Done computing average absorbance per kernel\n'])
+%%
+end
+
+%
